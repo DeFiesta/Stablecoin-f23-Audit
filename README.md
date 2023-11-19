@@ -10,7 +10,7 @@ This project is meant to describe exploitable bugs detect on Cyfrin stablecoin p
   - [H2-Strict enforcement of the liquidation bonus is causing prevention of liquidation.](#H2)
   - [H3-small positions can not be liquidated](#H3)
   - [H4-Business Logic: Protocol Liquidation Arithmetic](#H4)
-  - [M1-staleCheckLatestRoundData() does not check the status of the Arbitrum sequencer in Chainlink feeds.] (#M1)
+  - [M1-No arbitrum sequencer status check in cainlink feed](#M1)
   - [M2-protocol can consume stale price data or cannot operate on some EVM chains](#M2)
   - [M3-Chainlink oracle will return the wrong price if the aggregator hits minAnswer](#M3)
 
