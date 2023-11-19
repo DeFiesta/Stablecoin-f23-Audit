@@ -5,7 +5,7 @@
 This project is meant to describe exploitable bugs detect on Cyfrin stablecoin project which aims to create a stablecoin where users can deposit WETH and WBTC in exchange for a token that will be pegged to the USD. Please find the source code here: https://github.com/DeFiesta/foundry-defi-stablecoin-f23
 
 - [About](#about)
-- [AuditReport](#Audit Report)
+- [AuditReport](#AuditReport)
   - [H1-token with less than 18 decimals can be stolen](#H1)
   - [H2-Strict enforcement of the liquidation bonus is causing prevention of liquidation.](#H2)
   - [H3-small positions can not be liquidated](#H3)
