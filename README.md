@@ -5,7 +5,7 @@
 This project is meant to describe exploitable bugs detect on Cyfrin stablecoin project which aims to create a stablecoin where users can deposit WETH and WBTC in exchange for a token that will be pegged to the USD. Please find the source code here: https://github.com/DeFiesta/foundry-defi-stablecoin-f23
 
 - [About](#about)
-- [AuditReport](#AuditReport)
+- [AuditReport](#Audit Report)
   - [H1-token with less than 18 decimals can be stolen](#H1)
   - [H2-Strict enforcement of the liquidation bonus is causing prevention of liquidation.](#H2)
   - [H3-small positions can not be liquidated](#H3)
@@ -13,6 +13,13 @@ This project is meant to describe exploitable bugs detect on Cyfrin stablecoin p
   - [M1-No arbitrum sequencer status check in cainlink feed](#M1)
   - [M2-protocol can consume stale price data or cannot operate on some EVM chains](#M2)
   - [M3-Chainlink oracle will return the wrong price if the aggregator hits minAnswer](#M3)
+  - [M4-Anyone can burn DecentralizedStableCoin tokens with burnFrom function](#M4)
+  - [M5-Double-spending vulnerability leads to a disruption of the DSC token](#M5)
+  - [M6-Lack of fallbacks for price feed oracle](#M6)
+  - [M7-Too many DSC tokens can get minted for fee-on-transfer tokens.](#M7)
+  - [M8-liquidate does not allow the liquidator to liquidate a user if the liquidator HF < 1](#M8)
+  - [M9-Protocol can break for a token with a proxy and implementation contract (like TUSD)](#M9)
+  - [M10-DoS of full liquidations are possible by frontrunning the liquidators](#M10)
 
 
 # Audit Report
@@ -237,4 +244,434 @@ require(answer < maxPrice, "Max price exceeded");
 ```
 
 Also some gas could be saved when used revert with custom error for doing the check.
+
+## Medium-04 Anyone can burn DecentralizedStableCoin tokens with burnFrom function
+
+Anyone can burn DSC tokens with burnFrom function inherited of OZ ERC20Burnable contract
+
+### Vulnerability Details
+
+In the DecentralizedStableCoin contract the burn function is onlyOwner and is used by DSCEngine contract, which is the owner of DecentralizedStableCoin contract
+
+### Impact
+
+The tokens can be burned with burnFrom function bypassing the onlyOwner modifier of the burn functions
+
+### Recommendations
+
+Block the burnFrom function of OZ ERC20Burnable contract
+
+## Medium-05 Double-spending vulnerability leads to a disruption of the DSC token
+
+There is a double-spending vulnerability in the DSCEngine contract, leading to a disruption of the DSC token.
+
+### Vulnerability Details
+
+While constructing the DSCEngine contract, the whitelisted collateral tokens will be registered along with their corresponding price feed addresses. However, the registration process does not verify that a token cannot be registered twice.
+
+For instance, assume that the ETH address is inputted in the array tokenAddresses twice, the ETH address will also be pushed into the array s_collateralTokens twice.
+
+```
+    constructor(address[] memory tokenAddresses, address[] memory priceFeedAddresses, address dscAddress) {
+        // USD Price Feeds
+        if (tokenAddresses.length != priceFeedAddresses.length) {
+            revert DSCEngine__TokenAddressesAndPriceFeedAddressesMustBeSameLength();
+        }
+        // For example ETH / USD, BTC / USD, MKR / USD, etc
+        for (uint256 i = 0; i < tokenAddresses.length; i++) {
+            s_priceFeeds[tokenAddresses[i]] = priceFeedAddresses[i];
+@>          s_collateralTokens.push(tokenAddresses[i]);
+        }
+        i_dsc = DecentralizedStableCoin(dscAddress);
+    }
+```
+
+Subsequently, when the contract executes the getAccountCollateralValue() to compute users' collateral value, the function will process on the ETH address twice. In other words, if a user/attacker deposits 10 ETH as collateral, the getAccountCollateralValue() will return 20 ETH (in USD value), leading to a double-spending issue.
+
+```
+    function getAccountCollateralValue(address user) public view returns (uint256 totalCollateralValueInUsd) {
+        // loop through each collateral token, get the amount they have deposited, and map it to
+        // the price, to get the USD value
+@>      for (uint256 i = 0; i < s_collateralTokens.length; i++) {
+@>          address token = s_collateralTokens[i];
+@>          uint256 amount = s_collateralDeposited[user][token];
+@>          totalCollateralValueInUsd += getUsdValue(token, amount);
+@>      }
+        return totalCollateralValueInUsd;
+    }
+```
+
+### Impact
+
+With this double-spending vulnerability, an attacker can deposit ETH to double their collateral value and then mint DSC tokens over the limit (breaking the protocol's health factor invariant).
+
+As a result, the DSCEngine contract will eventually be insolvent, and the DSC token will then be depegged to $0.
+
+### Recommendations
+
+To fix the vulnerability, I recommend adding the require(s_priceFeeds[tokenAddresses[i]] == address(0), "Collateral token was already set"); to guarantee that there could not be any token ever registered twice.
+
+```
+    constructor(address[] memory tokenAddresses, address[] memory priceFeedAddresses, address dscAddress) {
+        // USD Price Feeds
+        if (tokenAddresses.length != priceFeedAddresses.length) {
+            revert DSCEngine__TokenAddressesAndPriceFeedAddressesMustBeSameLength();
+        }
+        // For example ETH / USD, BTC / USD, MKR / USD, etc
+        for (uint256 i = 0; i < tokenAddresses.length; i++) {
++           require(s_priceFeeds[tokenAddresses[i]] == address(0), "Collateral token was already set");
+            s_priceFeeds[tokenAddresses[i]] = priceFeedAddresses[i];
+            s_collateralTokens.push(tokenAddresses[i]);
+        }
+        i_dsc = DecentralizedStableCoin(dscAddress);
+    }
+```
+
+## Medium-06 Lack of fallbacks for price feed oracle
+
+The DSC protocol does not implement fallback solutions for price feed oracle. In case Chainlink's aggregators fail to update price data, the protocol will refuse to liquidate users' positions, leading to the protocol's disruption.
+
+### Vulnerability Details
+
+The DSC protocol utilizes the staleCheckLatestRoundData() for querying price data of collateral tokens through Chainlink's price feed aggregators. Nonetheless, if Chainlink's aggregators fail to update the price data, the DSC protocol will not be able to operate. In other words, the function will revert transactions since the received price data become stale.
+
+```
+    function staleCheckLatestRoundData(AggregatorV3Interface priceFeed)
+        public
+        view
+        returns (uint80, int256, uint256, uint256, uint80)
+    {
+@>      (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound) =
+@>          priceFeed.latestRoundData();
+
+        uint256 secondsSince = block.timestamp - updatedAt;
+@>      if (secondsSince > TIMEOUT) revert OracleLib__StalePrice();
+
+        return (roundId, answer, startedAt, updatedAt, answeredInRound);
+    }
+```
+
+### Impact
+
+Without fallback solutions, the DSC protocol will be unable to operate if Chainlink's aggregators fail to update price data.
+
+Consider the scenario that Chainlink's aggregators fail to update price data and collateral tokens' prices dramatically go down, the DSC protocol will refuse to liquidate users' positions. Consequently, the protocol will become insolvent eventually, leading to the protocol's disruption.
+
+### Recommendations
+
+We recommend implementing fallback solutions, such as using other off-chain oracle providers and/or on-chain Uniswap's TWAP, for feeding price data in case Chainlink's aggregators fail.
+
+## Medium-07 Too many DSC tokens can get minted for fee-on-transfer tokens.
+
+The DSCEngine contract overcalculates the collateral when operating with fee-on-transfer tokens, which can lead to too many DSC tokens being minted.
+
+### Vulnerability details
+
+The competition description mentions that while the first use-case for the system will be a WETH/WBTC backed stablecoin, the system is supposed to generally work with any collateral tokens. If one or more collateral tokens are fee-on-transfer tokens, i.e., when transferring X tokens, only X - F tokens arrive at the recipient side, where F denotes the transfer fee, depositors get credited too much collateral, meaning more DSC tokens can get minted, which leads to a potential depeg.
+
+The root cause is the depositCollateral function in DSCEngine:
+```
+function depositCollateral(address tokenCollateralAddress, uint256 amountCollateral)
+        public
+        moreThanZero(amountCollateral)
+        isAllowedToken(tokenCollateralAddress)
+        nonReentrant
+    {
+        s_collateralDeposited[msg.sender][tokenCollateralAddress] += amountCollateral;
+        emit CollateralDeposited(msg.sender, tokenCollateralAddress, amountCollateral);
+        bool success = IERC20(tokenCollateralAddress).transferFrom(msg.sender, address(this), amountCollateral);
+        if (!success) {
+            revert DSCEngine__TransferFailed();
+        }
+    }
+```
+
+AS can be seen in line
+```
+bool success = IERC20(tokenCollateralAddress).transferFrom(msg.sender, address(this), amountCollateral);
+```
+
+the contract assumes that the full amountCollateral is received, which might not be the case with fee-on-transfer tokens.
+
+### Impact
+
+When the contract operates with fee-on-transfer tokens as collateral, too many DSC tokens can get minted based on the overcalculated collateral, potentially leading to a depeg.
+
+### Recommendations
+
+Check the actual amount of received tokens:
+
+```
+function depositCollateral(address tokenCollateralAddress, uint256 amountCollateral)
+        public
+        moreThanZero(amountCollateral)
+        isAllowedToken(tokenCollateralAddress)
+        nonReentrant
+    {
+        uint256 balanceBefore = IERC20(tokenCollateralAddress).balanceOf(address(this));
+        bool success = IERC20(tokenCollateralAddress).transferFrom(msg.sender, address(this), amountCollateral);
+        uint256 balanceAfter = IERC20(tokenCollateralAddress).balanceOf(address(this));
+        amountCollateral = balanceAfter - balanceBefore;
+        if (!success) {
+            revert DSCEngine__TransferFailed();
+        }
+        s_collateralDeposited[msg.sender][tokenCollateralAddress] += amountCollateral;
+        emit CollateralDeposited(msg.sender, tokenCollateralAddress, amountCollateral);
+    }
+```
+
+## Medium-08. liquidate does not allow the liquidator to liquidate a user if the liquidator HF < 1
+
+The liquidate function does not allow the liquidator to liquidate the borrower if the liquidatorHF < 1.
+By liquidating a user, the liquidator is using his own funds that do not impact the liquidator HF directly.
+Because the function reverts, the system is preventing a user's to perform an action that should be able to do.
+
+### Vulnerability Details
+
+The liquidate function does not allow the liquidator to liquidate the borrower if the liquidatorHF < 1.
+By liquidating a user, the liquidator is using his own funds that do not impact the liquidator HF directly.
+Because the function reverts, the system is preventing a user's to perform an action that should be able to do.
+
+### Impact
+
+A liquidator cannot liquidate a user's debt when the liquidator's HF is below 1. The system is preventing a user to perform an action that does not impact his own HF.
+
+### PoC
+
+```
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.19;
+
+import {DSCEngine} from "../../src/DSCEngine.sol";
+import {DecentralizedStableCoin} from "../../src/DecentralizedStableCoin.sol";
+import {HelperConfig} from "../../script/HelperConfig.s.sol";
+import {ERC20Mock} from "@openzeppelin/contracts/mocks/ERC20Mock.sol";
+import {Test, console} from "forge-std/Test.sol";
+import {StdCheats} from "forge-std/StdCheats.sol";
+import {MockV3Aggregator} from "../mocks/MockV3Aggregator.sol";
+
+contract CannotLiquidateWhenHFTest is StdCheats, Test {
+    DSCEngine public dsce;
+    DecentralizedStableCoin public dsc;
+    HelperConfig public helperConfig;
+
+    address[] public tokenAddresses;
+    address[] public priceFeedAddresses;
+
+    address public ethUsdPriceFeed;
+    address public btcUsdPriceFeed;
+    address public weth;
+    address public wbtc;
+    uint256 public deployerKey;
+
+    uint256 amountCollateral = 10 ether;
+    uint256 amountToMint = 100 ether;
+    address public user = address(1);
+
+    uint256 public constant STARTING_USER_BALANCE = 10 ether;
+    uint256 public constant MIN_HEALTH_FACTOR = 1e18;
+    uint256 public constant LIQUIDATION_THRESHOLD = 50;
+
+
+    function setUp() external {
+        helperConfig = new HelperConfig();
+
+        (ethUsdPriceFeed, btcUsdPriceFeed, weth, wbtc, deployerKey) = helperConfig.activeNetworkConfig();
+
+        tokenAddresses = [weth, wbtc];
+        priceFeedAddresses = [ethUsdPriceFeed, btcUsdPriceFeed];
+
+        dsc = new DecentralizedStableCoin();
+        dsce = new DSCEngine(tokenAddresses, priceFeedAddresses, address(dsc));
+
+        dsc.transferOwnership(address(dsce));
+
+        if (block.chainid == 31337) {
+            vm.deal(user, STARTING_USER_BALANCE);
+        }
+        
+        ERC20Mock(weth).mint(user, STARTING_USER_BALANCE);
+        ERC20Mock(wbtc).mint(user, STARTING_USER_BALANCE);
+    }
+
+function testLiquidateRevertIfLiquidatorHFBelow() public {
+        vm.startPrank(user);
+        ERC20Mock(weth).approve(address(dsce), amountCollateral);
+        dsce.depositCollateralAndMintDsc(weth, amountCollateral, amountToMint);
+        vm.stopPrank();
+
+        // liquidator 
+        address liquidator = makeAddr("liquidator");
+        ERC20Mock(weth).mint(liquidator, STARTING_USER_BALANCE);
+
+        vm.startPrank(liquidator);
+        ERC20Mock(weth).approve(address(dsce), amountCollateral);
+        dsce.depositCollateralAndMintDsc(weth, amountCollateral, amountToMint);
+        vm.stopPrank();
+
+        // now let's say that price goes down
+        int256 ethUsdUpdatedPrice = 18e8; // 1 ETH = $18
+
+        MockV3Aggregator(ethUsdPriceFeed).updateAnswer(ethUsdUpdatedPrice);
+        assertLt(dsce.getHealthFactor(user), 1e18);
+        assertLt(dsce.getHealthFactor(liquidator), 1e18);
+
+
+        // Liquidator try to liquidate 1 wei of user's debt but it will revert because of the check
+        vm.startPrank(liquidator);
+        dsc.approve(address(dsce), 1 ether);
+
+        // system revert because `liquidator` has HF < 1
+        vm.expectRevert();
+        dsce.liquidate(weth, user, 1 ether);
+        vm.stopPrank();
+
+
+        vm.startPrank(liquidator);
+
+        // Liquidator supply 1000 ether and supply them to have HF > 1
+        ERC20Mock(weth).mint(liquidator, 1000 ether);
+        ERC20Mock(weth).approve(address(dsce), 1000 ether);
+        dsce.depositCollateral(weth, 1000 ether);
+
+        
+        uint256 liquidatorHFBefore = dsce.getHealthFactor(liquidator);
+        assertGe(liquidatorHFBefore, 1e18);
+
+        // perform liquidation again and prove that HF of liquidator does not change because of the liquidation itself
+        dsc.approve(address(dsce), 1 ether);
+        dsce.liquidate(weth, user, 1 ether);
+
+        // The liquidator is using his own funds that do not impact the liquidator HF
+        assertEq(dsce.getHealthFactor(liquidator), liquidatorHFBefore);
+        vm.stopPrank();
+    }
+}
+```
+
+### Recommendations
+
+The system should remove the check _revertIfHealthFactorIsBroken(msg.sender); in the liquidate() function, allowing a liquidator to always be able to liquidate a borrower.
+
+## Medium-09 Protocol can break for a token with a proxy and implementation contract (like TUSD)
+
+Tokens whose code and logic can be changed in future can break the protocol and lock user funds.
+
+### Vulnerability Details
+
+For a token like TUSD (supported by Chainlink TUSD/USD price feed), which has a proxy and implementation contract, if the implementation behind the proxy is changed, it can introduce features which break the protocol, like choosing to not return a bool on transfer(), or changing the balance over time like a rebasing token.
+
+### Impact
+
+Protocol may break in future for this collateral and block user funds deposited as collateral. Also can cause bad loans to be present with no way to liquidate them.
+
+### Recommendations
+
+Developers integrating with upgradable tokens should consider introducing logic that will freeze interactions with the token in question if an upgrade is detected. (e.g. the TUSD adapter used by MakerDAO).
+OR have a token whitelist which does not allow such tokens.
+
+## Medium-11. Liquidators can be front-run to their loss
+
+DSC liquidators are prone to oracle price manipulations and MEV front-run attacks
+
+### Vulnerability Details
+
+Sudden token price changes caused by oracle price manipulations and MEV front-run can cause liquidators to get less than expected collateral tokens.
+
+### Impact
+
+Liquidators stand to earn less than expected collateral tokens for deposited DSC
+
+### Recommendations
+
+Function liquidate should have an input parameter uint256 minimumOutputTokens and the function should revert at Ln 253 if
+
+```
+require(totalCollateralToRedeem >= minimumOutputTokens, "Too little collateral received.");  
+```
+
+## Medium-10. DoS of full liquidations are possible by frontrunning the liquidators
+
+Liquidators must specify precise amounts of DSC tokens to be burned during the liquidation process. Unfortunately, this opens up the possibility for malicious actors to prevent the full liquidation by frontrunning the liquidator's transaction and liquidating minimal amounts of DSC.
+
+### Vulnerability Details
+
+Liquidations play a crucial role by maintaining collateralization above the desired ratio. If the value of the collateral drops, or if the user mints too much DSC tokens and breaches the minimum required ratio, the position becomes undercollateralized, posing a risk to the protocol. Liquidations help in enforcing these collateralization ratios, enabling DSC to maintain its value.
+
+After detecting an unhealthy position, any liquidator can call the liquidate() function to burn the excess DSC tokens and receive part of the user's collateral as reward. To execute this function, the liquidator must specify the precise amount of DSC tokens to be burned. Due to this requirement, it becomes possible to block full liquidations (i.e liquidations corresponding to the user's entire minted amounts of DSC). This can be achieved by any address other than the one undergoing liquidation. This includes either a secondary address of the user being liquidated (attempting to protect their collateral), or any other malicious actor aiming to obstruct the protocol's re-collaterization. The necessity of using any address other than the one undergoing liquidation is due to the _revertIfHealthFactorIsBroken(msg.sender) at the end of the liquidate() function, therefore any other healthy address can be used to perform this attack.
+
+This blocking mechanism operates by frontrunning the liquidator and triggering the liquidation of small amounts of DSC balance. Consequently, during the liquidator's transaction execution, it attempts to burn more tokens than the user has actually minted. This causes a revert due to an underflow issue, as illustrated in the code snippet below.
+
+```
+function _burnDsc(uint256 amountDscToBurn, address onBehalfOf, address dscFrom) private {
+    s_DSCMinted[onBehalfOf] -= amountDscToBurn; //Undeflow will happen here
+    bool success = i_dsc.transferFrom(dscFrom, address(this), amountDscToBurn);
+    if (!success) {
+        revert DSCEngine__TransferFailed();
+    }
+    i_dsc.burn(amountDscToBurn);
+}
+```
+
+### Impact
+
+Full liquidations can be blocked. Therefore liquidators will have to resort to partial liquidations that are less efficient and can leave dust debt in the contract, threatening the heatlh of the protocol.
+
+### Recommendations
+
+Consider allowing the liquidator to pass type(uint256).max as the debtToCover parameter, which will result to liquidating all DSC minted by the target account, regardless of the current balance. See the code below for an example implementation.
+
+```
+diff --git a/DSCEngine.orig.sol b/DSCEngine.sol
+index e7d5c0d..6feef25 100644
+--- a/DSCEngine.orig.sol
++++ b/DSCEngine.sol
+@@ -227,36 +227,40 @@ contract DSCEngine is ReentrancyGuard {
+      * Follows CEI: Checks, Effects, Interactions
+      */
+     function liquidate(address collateral, address user, uint256 debtToCover)
+         external
+         moreThanZero(debtToCover)
+         nonReentrant
+     {
+         // need to check health factor of the user
+         uint256 startingUserHealthFactor = _healthFactor(user);
+         if (startingUserHealthFactor >= MIN_HEALTH_FACTOR) {
+             revert DSCEngine__HealthFactorOk();
+         }
+         // We want to burn their DSC "debt"
+         // And take their collateral
+         // Bad User: $140 ETH, $100 DSC
+         // debtToCover = $100
+         // $100 of DSC == ??? ETH?
+         // 0.05 ETH
++        if (debtToCover == type(uint256).max) {
++            (uint256 dscMinted,) = _getAccountInformation(user);
++            debtToCover = dscMinted;
++        }
+         uint256 tokenAmountFromDebtCovered = getTokenAmountFromUsd(collateral, debtToCover);
+         // And give them a 10% bonus
+         // So we are giving the liquidator $110 of WETH for 100 DSC
+         // We should implement a feature to liquidate in the event the protocol is insolvent
+         // And sweep extra amounts into a treasury
+         // 0.05 * 0.1 = 0.005. Getting 0.055
+         uint256 bonusCollateral = (tokenAmountFromDebtCovered * LIQUIDATION_BONUS) / LIQUIDATION_PRECISION;
+         uint256 totalCollateralToRedeem = tokenAmountFromDebtCovered + bonusCollateral;
+         _redeemCollateral(user, msg.sender, collateral, totalCollateralToRedeem);
+         // We need to burn the DSC
+         _burnDsc(debtToCover, user, msg.sender);
+
+         uint256 endingUserHealthFactor = _healthFactor(user);
+         if (endingUserHealthFactor <= startingUserHealthFactor) {
+             revert DSCEngine__HealthFactorNotImproved();
+         }
+         _revertIfHealthFactorIsBroken(msg.sender);
+     }
+```
+
+
+
+
+
 
